@@ -5,3 +5,7 @@ dist/
 *.js.map
 coverage/
 .DS_Store
+
+# These are separate repos — not submodules
+demo-app/
+paperclip-demo-target/
