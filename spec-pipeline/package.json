@@ -10,7 +10,8 @@
     "test": "jest",
     "test:coverage": "jest --coverage",
     "build": "tsc --noEmit",
-    "compile": "tsc"
+    "compile": "tsc",
+    "demo": "ts-node src/pipeline/cli.ts demo/add-items-crud.md https://github.com/MohammedAlsabih/spec-pipeline-demo-app"
   },
   "keywords": [],
   "author": "",
@@ -24,10 +25,14 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.92.0",
+    "@types/diff": "^7.0.2",
     "@types/js-yaml": "^4.0.9",
     "@types/node-fetch": "^2.6.13",
+    "diff": "^9.0.0",
     "js-yaml": "^4.1.1",
     "node-fetch": "^2.7.0",
+    "simple-git": "^3.36.0",
     "zod": "^4.4.2"
   }
 }
