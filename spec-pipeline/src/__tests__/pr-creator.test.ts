@@ -1,6 +1,12 @@
-import { createPr } from '../pr-creator';
+import { createPr, PrAuthorizationRejection } from '../pr-creator';
 import type { CodegenOutput } from '../code-generator';
 import type { ImplementationPlan } from '../architecture-proposer';
+import type {
+  AdminCheckLogEntry,
+  AdminCheckLogger,
+  InstallationLookup,
+  RepoPermission,
+} from '../repo-auth';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -130,5 +136,114 @@ describe('createPr', () => {
     expect((capturedBody as { body: string }).body).toContain('items');
     expect((capturedBody as { body: string }).body).toContain('src/routes/items.ts');
     expect((capturedBody as { title: string }).title).toBe(MOCK_PLAN.summary);
+  });
+
+  // ---------------------------------------------------------------------------
+  // MAL-47 defense-in-depth: PR-open admin re-check
+  // ---------------------------------------------------------------------------
+  describe('adminRecheck (MAL-47 / T17/O4 acceptance criterion 4)', () => {
+    function makeLookup(
+      installations: { owner: string; repo: string; installationId: number }[],
+      permission: RepoPermission,
+    ): InstallationLookup {
+      return {
+        async listUserInstallations() {
+          return installations;
+        },
+        async getUserRepoPermission() {
+          return permission;
+        },
+      };
+    }
+
+    function makeLogger(): AdminCheckLogger & { entries: AdminCheckLogEntry[] } {
+      const entries: AdminCheckLogEntry[] = [];
+      return {
+        entries,
+        log(entry) {
+          entries.push(entry);
+        },
+      };
+    }
+
+    it('re-check passes (App still installed, user still admin) → PR is opened', async () => {
+      mockFetch.mockResolvedValueOnce(
+        ghOk({ number: 21, html_url: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app/pull/21' })
+      );
+      const logger = makeLogger();
+      const result = await createPr({
+        repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+        defaultBranch: 'main',
+        codegenOutput: MOCK_OUTPUT,
+        plan: MOCK_PLAN,
+        githubToken: 'tok',
+        adminRecheck: {
+          userId: 'u1',
+          userToken: 'user-token',
+          lookup: makeLookup(
+            [{ owner: 'MohammedAlsabih', repo: 'spec-pipeline-demo-app', installationId: 7 }],
+            'admin',
+          ),
+          logger,
+        },
+      });
+      expect(result.pr_number).toBe(21);
+      expect(logger.entries).toHaveLength(1);
+      expect(logger.entries[0]).toMatchObject({
+        outcome: 'admitted',
+        stage: 'pr-open',
+        installationId: 7,
+      });
+    });
+
+    it('re-check rejects (App revoked between submission and PR-open) → no PR is opened', async () => {
+      // Lookup returns empty installations — App was uninstalled since intake.
+      const logger = makeLogger();
+      await expect(
+        createPr({
+          repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+          defaultBranch: 'main',
+          codegenOutput: MOCK_OUTPUT,
+          plan: MOCK_PLAN,
+          githubToken: 'tok',
+          adminRecheck: {
+            userId: 'u1',
+            userToken: 'user-token',
+            lookup: makeLookup([], 'admin'),
+            logger,
+          },
+        }),
+      ).rejects.toBeInstanceOf(PrAuthorizationRejection);
+      // Critical: GitHub API was never called — we rejected before push.
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(logger.entries[0]).toMatchObject({
+        outcome: 'rejected-no-installation',
+        stage: 'pr-open',
+      });
+    });
+
+    it('re-check rejects (user lost admin between submission and PR-open) → no PR is opened', async () => {
+      const logger = makeLogger();
+      await expect(
+        createPr({
+          repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+          defaultBranch: 'main',
+          codegenOutput: MOCK_OUTPUT,
+          plan: MOCK_PLAN,
+          githubToken: 'tok',
+          adminRecheck: {
+            userId: 'u1',
+            userToken: 'user-token',
+            lookup: makeLookup(
+              [{ owner: 'MohammedAlsabih', repo: 'spec-pipeline-demo-app', installationId: 7 }],
+              'read',
+            ),
+            logger,
+          },
+        }),
+      ).rejects.toBeInstanceOf(PrAuthorizationRejection);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(logger.entries[0]?.outcome).toBe('rejected-not-admin');
+    });
   });
 });

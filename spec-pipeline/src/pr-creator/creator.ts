@@ -5,6 +5,12 @@ import simpleGit from 'simple-git';
 import fetch from 'node-fetch';
 import { CodegenOutput } from '../code-generator';
 import { ImplementationPlan } from '../architecture-proposer';
+import {
+  checkInstallationAdmin,
+  type AdminCheckLogger,
+  type AdminCheckResult,
+  type InstallationLookup,
+} from '../repo-auth';
 
 const GH_API = 'https://api.github.com';
 
@@ -13,6 +19,25 @@ export interface PrResult {
   pr_number: number;
   branch: string;
   html_url: string;
+}
+
+// MAL-47 defense-in-depth: the same admin check the intake gate runs is
+// re-invoked at PR-open. If the customer revoked the App (or lost admin)
+// between submission and now, we fail closed before pushing. Surface this
+// as PrAuthorizationRejection so callers can tell auth rejections apart
+// from network or git errors.
+export interface PrCreatorAdminRecheck {
+  userId: string;
+  userToken: string;
+  lookup: InstallationLookup;
+  logger: AdminCheckLogger;
+}
+
+export class PrAuthorizationRejection extends Error {
+  constructor(public readonly result: Extract<AdminCheckResult, { ok: false }>) {
+    super(result.safeMessage);
+    this.name = 'PrAuthorizationRejection';
+  }
 }
 
 function slug(text: string): string {
@@ -52,6 +77,11 @@ export async function createPr(options: {
   codegenOutput: CodegenOutput;
   plan: ImplementationPlan;
   githubToken?: string;
+  // MAL-47 defense-in-depth: when set, re-runs the spec-submission admin
+  // check immediately before clone/push. If the App was uninstalled or the
+  // user lost admin between submission and now, we throw
+  // PrAuthorizationRejection and never push or open a PR.
+  adminRecheck?: PrCreatorAdminRecheck;
 }): Promise<PrResult> {
   const { repoUrl, defaultBranch, codegenOutput, plan } = options;
   const token = options.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
@@ -60,6 +90,28 @@ export async function createPr(options: {
   const match = repoUrl.match(/github\.com[/:]([^/]+)\/([^/.]+?)(?:\.git)?$/);
   if (!match) throw new Error(`Cannot parse GitHub URL: ${repoUrl}`);
   const [, owner, repo] = match;
+
+  // MAL-47 defense-in-depth re-check. Runs before any clone or push so a
+  // revoked installation cannot result in a partial push or a PR opened
+  // against a repo the user no longer admins. Failure surfaces the same
+  // safe (non-leaky) message as the intake gate.
+  if (options.adminRecheck) {
+    const recheck = await checkInstallationAdmin(
+      {
+        userId: options.adminRecheck.userId,
+        userToken: options.adminRecheck.userToken,
+        repoUrl,
+        stage: 'pr-open',
+      },
+      {
+        lookup: options.adminRecheck.lookup,
+        logger: options.adminRecheck.logger,
+      },
+    );
+    if (!recheck.ok) {
+      throw new PrAuthorizationRejection(recheck);
+    }
+  }
 
   const branch = branchName(plan.summary);
   const cloneUrl = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;

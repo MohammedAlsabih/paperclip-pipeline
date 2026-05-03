@@ -5,6 +5,23 @@ import { proposeArchitecture } from '../architecture-proposer';
 import { generateCode } from '../code-generator';
 import { createPr } from '../pr-creator';
 import { generateReviewSummary } from '../review-summary';
+import {
+  checkInstallationAdmin,
+  type AdminCheckLogger,
+  type AdminCheckResult,
+  type InstallationLookup,
+} from '../repo-auth';
+
+export interface AdminAuthConfig {
+  // Stable identifier for the requesting user. Whatever the caller uses to
+  // attribute pipeline runs (email hash, GitHub user ID, internal user UUID).
+  userId: string;
+  // OAuth user token. Used to query GitHub for the user's installations and
+  // their repo permission. Must be a user token, not an installation token.
+  userToken: string;
+  lookup: InstallationLookup;
+  logger: AdminCheckLogger;
+}
 
 export interface PipelineOptions {
   specPath: string;
@@ -12,6 +29,23 @@ export interface PipelineOptions {
   githubToken?: string;
   anthropicApiKey?: string;
   verbose?: boolean;
+  // MAL-47 / threat T17/O4: optional admin-validation gate. If supplied,
+  // the pipeline asserts the requesting user (`adminAuth.userId`) has the
+  // GitHub App installed on `repoUrl` and holds admin on it BEFORE any LLM
+  // call or repo clone. Local CLI demos may omit it (single-user mode);
+  // multi-tenant deploys MUST pass it. The same shape is re-invoked from
+  // `pr-creator` as defense-in-depth at PR-open.
+  adminAuth?: AdminAuthConfig;
+}
+
+// Thrown when the admin-validation gate rejects the request. Carries the
+// safe (non-leaky) message for the API caller and the internal reason code
+// for logs / metrics.
+export class SpecAuthorizationRejection extends Error {
+  constructor(public readonly result: Extract<AdminCheckResult, { ok: false }>) {
+    super(result.safeMessage);
+    this.name = 'SpecAuthorizationRejection';
+  }
 }
 
 export interface PipelineResult {
@@ -33,12 +67,50 @@ function timed<T>(label: string, timings: Record<string, number>, fn: () => Prom
   });
 }
 
+// Helper: run the admin-validation gate. Exported so a future HTTP ingress
+// can call this on its own at spec-submission time without invoking the
+// rest of the pipeline (the issue framing is "fail fast at intake"). The
+// pipeline below also calls it as the first step when `adminAuth` is set,
+// so a single call to runPipeline is still safe in multi-tenant deploys.
+export async function validateSpecSubmission(
+  repoUrl: string,
+  adminAuth: AdminAuthConfig,
+): Promise<AdminCheckResult> {
+  return checkInstallationAdmin(
+    {
+      userId: adminAuth.userId,
+      userToken: adminAuth.userToken,
+      repoUrl,
+      stage: 'submission',
+    },
+    { lookup: adminAuth.lookup, logger: adminAuth.logger },
+  );
+}
+
 export async function runPipeline(options: PipelineOptions): Promise<PipelineResult> {
   const { specPath, repoUrl, verbose = true } = options;
   const githubToken = options.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const anthropicApiKey = options.anthropicApiKey ?? process.env.ANTHROPIC_API_KEY;
 
   const timings: Record<string, number> = {};
+
+  // Step 0 (MAL-47): admin-validation gate. Runs before parse so an
+  // unauthorized caller does not even get their spec normalized — we don't
+  // want to hand a hostile actor diagnostics about parse-time validation.
+  // Failure throws SpecAuthorizationRejection with a non-leaky message
+  // (T9-clean): same generic reply for "no installation" and "not admin"
+  // so a hostile probe can't enumerate which target repos have the App.
+  if (options.adminAuth) {
+    log(verbose, '→ [auth] Validating user-is-admin on target repo...');
+    const authResult = await timed('admin_check', timings, () =>
+      validateSpecSubmission(repoUrl, options.adminAuth!),
+    );
+    if (!authResult.ok) {
+      log(verbose, `  ✗ Authorization rejected: ${authResult.reason}`);
+      throw new SpecAuthorizationRejection(authResult);
+    }
+    log(verbose, `  ✓ User is admin on ${authResult.owner}/${authResult.repo}`);
+  }
 
   // Step 1: Parse spec
   log(verbose, '→ [1/6] Parsing spec...');
@@ -78,6 +150,11 @@ export async function runPipeline(options: PipelineOptions): Promise<PipelineRes
       codegenOutput,
       plan,
       githubToken,
+      // MAL-47 defense-in-depth: re-run the admin check at PR-open. If the
+      // installation was revoked between submission and now, this rejects
+      // before we push. Logged with stage=pr-open so the audit trail can
+      // tell intake checks from re-checks.
+      adminRecheck: options.adminAuth,
     })
   );
   log(verbose, `  ✓ PR opened: ${prResult.pr_url}`);
