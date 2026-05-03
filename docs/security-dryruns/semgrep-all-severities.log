@@ -1,0 +1,54 @@
+METRICS: Using configs from the Registry (like --config=p/ci) reports pseudonymous rule metrics to semgrep.dev.
+To disable Registry rule metrics, use "--metrics=off".
+Using configs only from local files (like --config=xyz.yml) does not enable metrics.
+
+More information: https://semgrep.dev/docs/metrics
+
+               
+               
+┌─────────────┐
+│ Scan Status │
+└─────────────┘
+  Scanning 57 files tracked by git with 660 Code rules:
+                                                                                                                        
+  Language      Rules   Files          Origin      Rules                                                                
+ ─────────────────────────────        ───────────────────                                                               
+  <multilang>       6      53          Community     660                                                                
+  ts              187      30                                                                                           
+  json              3       6                                                                                           
+  yaml             19       4                                                                                           
+  js              181       2                                                                                           
+                                                                                                                        
+                  
+                  
+┌────────────────┐
+│ 1 Code Finding │
+└────────────────┘
+                                                          
+    /repo/spec-pipeline/src/__tests__/repo-context.test.ts
+    ❯❱ ajinabraham.njsscan.generic.hardcoded_secrets.node_username
+          A hardcoded username in plain text is identified. Store it properly in an environment variable.
+          Details: https://sg.run/5z6X                                                                   
+                                                                                                         
+           62┆ const MOCK_USERS_TS = `
+           63┆ import { Router } from 'express';
+           64┆ import { verifyJwt } from '../middleware/jwt';
+           65┆ const router = Router();
+           66┆ router.get('/', verifyJwt, (req, res) => res.json([]));
+           67┆ router.get('/:id', verifyJwt, (req, res) => res.json({}));
+           68┆ export default router;
+
+                
+                
+┌──────────────┐
+│ Scan Summary │
+└──────────────┘
+Some files were skipped or only partially analyzed.
+  Scan was limited to files tracked by git.
+  Scan skipped: 4 files matching --exclude patterns
+  For a full list of skipped files, run semgrep with the --verbose flag.
+
+Ran 215 rules on 53 files: 1 finding.
+
+A new version of Semgrep is available. See https://semgrep.dev/docs/upgrading
+exit=0
