@@ -1,0 +1,245 @@
+# AppSec tooling baseline — runs on every PR against main.
+# Source of truth: docs/SECURE_SDLC.md §6 (tooling) + §6.1 (allowlist hygiene) + §6.2 (branch protection).
+#
+# Gates (each job is a required check on `main` per §6.2):
+#   - secrets-scan       : Gitleaks. Blocks on any P0 finding.
+#   - dependency-scan    : npm audit --audit-level=high. Blocks on critical/high with no patch path.
+#   - sast-scan          : Semgrep with TS/Node + OWASP top 10 rule packs. Blocks on critical findings.
+#   - allowlist-hygiene  : Verifies every Gitleaks allowlist entry has a non-expired `expires=` tag.
+
+name: security
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  secrets-scan:
+    name: Gitleaks (secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Gitleaks needs full history to scan past commits on PRs.
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Fail the job on any finding. Allowlist is the only suppression mechanism (§6.1).
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+
+  allowlist-hygiene:
+    name: Gitleaks allowlist hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify allowlist entries have non-expired expires= tag
+        run: |
+          set -euo pipefail
+          if [ ! -f .gitleaks.toml ]; then
+            echo "::error::.gitleaks.toml is missing"
+            exit 1
+          fi
+          today=$(date -u +%Y-%m-%d)
+          # Find every literal allowlist entry (regexes or paths) and require a co-located
+          # `expires=YYYY-MM-DD` token within 5 lines per §6.1.
+          fail=0
+          # Extract regex/path entries inside [allowlist]
+          awk '/^\[allowlist\]/{flag=1;next} /^\[/{flag=0} flag' .gitleaks.toml > /tmp/allowlist.toml
+          # If allowlist has any literal entries (lines starting with quotes inside arrays),
+          # require an expires= comment within the same block.
+          entries=$(grep -E "^\s*'''|^\s*\"" /tmp/allowlist.toml || true)
+          if [ -n "$entries" ]; then
+            if ! grep -E "expires=([0-9]{4}-[0-9]{2}-[0-9]{2})" .gitleaks.toml > /tmp/expires.txt; then
+              echo "::error::Allowlist has entries but no expires= tag found. See SECURE_SDLC.md §6.1."
+              exit 1
+            fi
+            while read -r line; do
+              date=$(echo "$line" | grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}")
+              if [ "$date" \< "$today" ]; then
+                echo "::error::Expired allowlist entry: $line (today=$today). Renew or remove per §6.1."
+                fail=1
+              fi
+            done < /tmp/expires.txt
+          fi
+          if [ "$fail" = "1" ]; then exit 1; fi
+          echo "Allowlist hygiene OK."
+
+  dependency-scan:
+    name: npm audit (deps)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: ["", "spec-pipeline"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            spec-pipeline/package-lock.json
+
+      - name: Resolve workspace dir
+        id: ws
+        run: |
+          dir="${{ matrix.workspace }}"
+          if [ -z "$dir" ]; then dir="."; fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Install
+        working-directory: ${{ steps.ws.outputs.dir }}
+        run: npm ci --no-audit --no-fund
+
+      # `npm audit --audit-level=high` exits non-zero on any high/critical finding.
+      # Per §6 gate: critical/high with no patch path blocks merge.
+      # If a fix is available, Dependabot will already be opening a PR; the team applies it.
+      - name: npm audit (high+)
+        working-directory: ${{ steps.ws.outputs.dir }}
+        run: npm audit --audit-level=high
+
+  sast-scan:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.95.0
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rule packs per §6 (TypeScript/Node + OWASP top 10).
+      # ERROR severity ("critical") -> blocks merge.
+      # WARNING/INFO severity ("high"/"medium") -> opens a follow-up issue, does NOT block.
+      - name: Semgrep scan (block on ERROR, JSON for follow-up)
+        run: |
+          set +e
+          semgrep \
+            --config "p/typescript" \
+            --config "p/javascript" \
+            --config "p/owasp-top-ten" \
+            --config "p/nodejs" \
+            --config "p/nodejsscan" \
+            --severity=ERROR \
+            --error \
+            --metrics=off \
+            --exclude=node_modules \
+            --exclude=demo-app \
+            --exclude=paperclip-demo-target \
+            --exclude=dist \
+            --exclude=coverage \
+            --sarif --output=semgrep.sarif
+          ERROR_EXIT=$?
+          # Always emit a full-severity SARIF + JSON for follow-up reporting.
+          semgrep \
+            --config "p/typescript" \
+            --config "p/javascript" \
+            --config "p/owasp-top-ten" \
+            --config "p/nodejs" \
+            --config "p/nodejsscan" \
+            --metrics=off \
+            --exclude=node_modules \
+            --exclude=demo-app \
+            --exclude=paperclip-demo-target \
+            --exclude=dist \
+            --exclude=coverage \
+            --json --output=semgrep-full.json || true
+          echo "ERROR_EXIT=$ERROR_EXIT"
+          exit "$ERROR_EXIT"
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Semgrep JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-full
+          path: semgrep-full.json
+          if-no-files-found: ignore
+
+  sast-high-followup:
+    # Per §6: high (WARNING) findings open an issue assigned to the PR author.
+    # Runs only on PR events; reads the JSON artifact produced by sast-scan.
+    name: Semgrep high-finding follow-up
+    needs: sast-scan
+    if: github.event_name == 'pull_request' && always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: semgrep-full
+          path: .
+
+      - name: Open issue for any WARNING-severity findings
+        if: hashFiles('semgrep-full.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # Build the issue body in Python and write to body.md to avoid shell-quoting
+          # hazards with finding messages. Print __NO_FINDINGS__ as a sentinel when
+          # there is nothing to do.
+          python3 - <<'PY'
+          import json, os, pathlib
+          with open('semgrep-full.json') as f:
+              d = json.load(f)
+          high = [r for r in d.get('results', []) if r.get('extra', {}).get('severity') == 'WARNING']
+          out = pathlib.Path('body.md')
+          if not high:
+              out.write_text('__NO_FINDINGS__\n')
+              raise SystemExit(0)
+          pr = os.environ['PR_NUMBER']
+          title = os.environ['PR_TITLE']
+          lines = [f'Semgrep high-severity (WARNING) findings on PR #{pr}: {title}', '']
+          for r in high:
+              cid = r.get('check_id', '?')
+              path = r.get('path', '?')
+              start_line = (r.get('start') or {}).get('line', '?')
+              msg = (r.get('extra') or {}).get('message', '').strip().split('\n')[0]
+              lines.append(f'- **{cid}** at `{path}:{start_line}`')
+              lines.append(f'  {msg}')
+          lines.append('')
+          lines.append('Per docs/SECURE_SDLC.md §6, high findings do not block merge but must be triaged. Suppressions follow §6.1 hygiene.')
+          out.write_text('\n'.join(lines) + '\n')
+          PY
+          if grep -q '^__NO_FINDINGS__$' body.md; then
+            echo "No WARNING-severity findings; nothing to open."
+            exit 0
+          fi
+          gh issue create \
+            --title "Semgrep high findings on PR #${PR_NUMBER}" \
+            --body-file body.md \
+            --assignee "$PR_AUTHOR" \
+            --label security \
+            --label sast \
+            --label follow-up

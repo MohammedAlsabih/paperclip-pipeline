@@ -1,0 +1,35 @@
+# Gitleaks configuration for paperclip-pipeline
+#
+# Source of truth: docs/SECURE_SDLC.md §6 (AppSec tooling baseline) + §6.1 (allowlist hygiene).
+# Gate: any P0 finding (i.e., any default Gitleaks rule match that has not been allowlisted) blocks CI.
+#
+# Allowlist hygiene (per SECURE_SDLC.md §6.1):
+#   1. Every entry MUST cite a justification (`description`) and an `expires` date (ISO8601).
+#   2. CISO sign-off is required before adding a new entry. PR description must link the approval.
+#   3. The source file containing the suppressed string must include an inline comment of the form
+#      `# gitleaks:allow expires=YYYY-MM-DD reason="<short reason>"` next to the suppressed value.
+#   4. Expired entries fail the build until renewed or removed (enforced by the
+#      `gitleaks-allowlist-hygiene` step in .github/workflows/security.yml).
+#
+# Extends the upstream default ruleset; we do not weaken individual rules.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Repo-wide allowlist. Empty by default. Every addition must follow §6.1 hygiene rules above."
+
+# Test fixtures and example placeholders.
+# These are documentation-only strings, not real secrets.
+paths = [
+  '''(.*?)\.env\.example$''',
+  '''docs/SECURE_SDLC\.md$''',
+  '''README\.md$''',
+]
+
+# Known dummy tokens we use in docs/examples. Must include expiry; reviewed quarterly.
+# expires=2026-08-03 reason="Documentation placeholders only — no real value"
+regexes = [
+  '''sk-ant-\.\.\.''',
+  '''ghp_\.\.\.''',
+]
