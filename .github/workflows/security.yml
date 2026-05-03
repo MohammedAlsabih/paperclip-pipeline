@@ -206,31 +206,40 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
-          # Filter to WARNING (high) only — ERROR (critical) already blocked the PR.
-          high=$(python3 -c "
-          import json,sys
-          d=json.load(open('semgrep-full.json'))
-          out=[r for r in d.get('results',[]) if r.get('extra',{}).get('severity')=='WARNING']
-          print(json.dumps(out))
-          ")
-          count=$(echo "$high" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
-          if [ "$count" = "0" ]; then
+          # Build the issue body in Python and write to body.md to avoid shell-quoting
+          # hazards with finding messages. Print __NO_FINDINGS__ as a sentinel when
+          # there is nothing to do.
+          python3 - <<'PY'
+          import json, os, pathlib
+          with open('semgrep-full.json') as f:
+              d = json.load(f)
+          high = [r for r in d.get('results', []) if r.get('extra', {}).get('severity') == 'WARNING']
+          out = pathlib.Path('body.md')
+          if not high:
+              out.write_text('__NO_FINDINGS__\n')
+              raise SystemExit(0)
+          pr = os.environ['PR_NUMBER']
+          title = os.environ['PR_TITLE']
+          lines = [f'Semgrep high-severity (WARNING) findings on PR #{pr}: {title}', '']
+          for r in high:
+              cid = r.get('check_id', '?')
+              path = r.get('path', '?')
+              start_line = (r.get('start') or {}).get('line', '?')
+              msg = (r.get('extra') or {}).get('message', '').strip().split('\n')[0]
+              lines.append(f'- **{cid}** at `{path}:{start_line}`')
+              lines.append(f'  {msg}')
+          lines.append('')
+          lines.append('Per docs/SECURE_SDLC.md §6, high findings do not block merge but must be triaged. Suppressions follow §6.1 hygiene.')
+          out.write_text('\n'.join(lines) + '\n')
+          PY
+          if grep -q '^__NO_FINDINGS__$' body.md; then
             echo "No WARNING-severity findings; nothing to open."
             exit 0
           fi
-          body=$(python3 -c "
-          import json,os
-          d=json.loads(os.environ['HIGH'])
-          lines=['Semgrep high-severity (WARNING) findings on PR #'+os.environ['PR_NUMBER']+': '+os.environ['PR_TITLE'],'']
-          for r in d:
-              lines.append('- **'+r['check_id']+'** at \`'+r['path']+':'+str(r['start']['line'])+'\`')
-              lines.append('  '+r.get('extra',{}).get('message','').strip().split(chr(10))[0])
-          lines.append('')
-          lines.append('Per docs/SECURE_SDLC.md §6, high findings do not block merge but must be triaged. Suppressions follow §6.1 hygiene.')
-          print(chr(10).join(lines))
-          " HIGH="$high")
           gh issue create \
             --title "Semgrep high findings on PR #${PR_NUMBER}" \
-            --body "$body" \
+            --body-file body.md \
             --assignee "$PR_AUTHOR" \
-            --label "security,sast,follow-up"
+            --label security \
+            --label sast \
+            --label follow-up
