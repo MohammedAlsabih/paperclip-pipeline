@@ -1,4 +1,4 @@
-import { createPr } from '../pr-creator';
+import { createPr, safeJoin } from '../pr-creator';
 import type { CodegenOutput } from '../code-generator';
 import type { ImplementationPlan } from '../architecture-proposer';
 
@@ -24,6 +24,11 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(),
   rmSync: jest.fn(),
 }));
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const fsMock = require('fs') as { writeFileSync: jest.Mock; mkdirSync: jest.Mock; mkdtempSync: jest.Mock; rmSync: jest.Mock };
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const simpleGitMock = require('simple-git') as jest.Mock;
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const mockFetch = require('node-fetch') as jest.Mock;
@@ -130,5 +135,167 @@ describe('createPr', () => {
     expect((capturedBody as { body: string }).body).toContain('items');
     expect((capturedBody as { body: string }).body).toContain('src/routes/items.ts');
     expect((capturedBody as { title: string }).title).toBe(MOCK_PLAN.summary);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security regression tests (MAL-43)
+// ---------------------------------------------------------------------------
+describe('safeJoin (B1 — path traversal)', () => {
+  it('rejects relative paths that escape the root', () => {
+    expect(() => safeJoin('/tmp/spec-pr-test', '../escape.txt')).toThrow(/escapes root/);
+    expect(() => safeJoin('/tmp/spec-pr-test', '../../etc/passwd')).toThrow(/escapes root/);
+    expect(() => safeJoin('/tmp/spec-pr-test', 'a/../../escape.txt')).toThrow(/escapes root/);
+  });
+
+  it('rejects absolute paths', () => {
+    expect(() => safeJoin('/tmp/spec-pr-test', '/abs/path')).toThrow(/absolute path/);
+    expect(() => safeJoin('/tmp/spec-pr-test', '/etc/passwd')).toThrow(/absolute path/);
+  });
+
+  it('accepts normal nested paths', () => {
+    expect(safeJoin('/tmp/spec-pr-test', 'src/routes/items.ts'))
+      .toMatch(/spec-pr-test[\\/]src[\\/]routes[\\/]items\.ts$/);
+  });
+});
+
+describe('createPr — path-traversal blocking (B1)', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    fsMock.writeFileSync.mockClear();
+    fsMock.mkdirSync.mockClear();
+  });
+
+  it('throws and does not write when files_created path escapes tmpDir', async () => {
+    const malicious: CodegenOutput = {
+      files_created: [{ path: '../escape.txt', content: 'pwned' }],
+      files_modified: [],
+    };
+
+    await expect(
+      createPr({
+        repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+        defaultBranch: 'master',
+        codegenOutput: malicious,
+        plan: MOCK_PLAN,
+        githubToken: 'tok',
+      })
+    ).rejects.toThrow(/escapes root/);
+
+    expect(fsMock.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('throws and does not write when files_created path is absolute', async () => {
+    const malicious: CodegenOutput = {
+      files_created: [{ path: '/abs/path', content: 'pwned' }],
+      files_modified: [],
+    };
+
+    await expect(
+      createPr({
+        repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+        defaultBranch: 'master',
+        codegenOutput: malicious,
+        plan: MOCK_PLAN,
+        githubToken: 'tok',
+      })
+    ).rejects.toThrow(/absolute path/);
+
+    expect(fsMock.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('throws and does not write when files_modified path escapes tmpDir', async () => {
+    const malicious: CodegenOutput = {
+      files_created: [],
+      files_modified: [
+        { path: '../../etc/passwd', original_content: 'old', new_content: 'pwned', patch: '' },
+      ],
+    };
+
+    await expect(
+      createPr({
+        repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+        defaultBranch: 'master',
+        codegenOutput: malicious,
+        plan: MOCK_PLAN,
+        githubToken: 'tok',
+      })
+    ).rejects.toThrow(/escapes root/);
+
+    expect(fsMock.writeFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe('createPr — token redaction (B2)', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    simpleGitMock.mockClear();
+  });
+
+  it('does not embed the token in the clone URL', async () => {
+    const cloneSpy = jest.fn().mockResolvedValue(undefined);
+    simpleGitMock.mockReturnValue({
+      clone: cloneSpy,
+      addConfig: jest.fn().mockResolvedValue(undefined),
+      checkoutLocalBranch: jest.fn().mockResolvedValue(undefined),
+      add: jest.fn().mockResolvedValue(undefined),
+      commit: jest.fn().mockResolvedValue(undefined),
+      push: jest.fn().mockResolvedValue(undefined),
+    });
+    mockFetch.mockResolvedValueOnce(
+      ghOk({ number: 99, html_url: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app/pull/99' })
+    );
+
+    const SYNTHETIC_TOKEN = 'ghp_SYNTHETIC_TEST_TOKEN_xyz123';
+    await createPr({
+      repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+      defaultBranch: 'master',
+      codegenOutput: MOCK_OUTPUT,
+      plan: MOCK_PLAN,
+      githubToken: SYNTHETIC_TOKEN,
+    });
+
+    expect(cloneSpy).toHaveBeenCalled();
+    const cloneUrl = cloneSpy.mock.calls[0][0] as string;
+    expect(cloneUrl).toBe('https://github.com/MohammedAlsabih/spec-pipeline-demo-app.git');
+    expect(cloneUrl).not.toContain(SYNTHETIC_TOKEN);
+    expect(cloneUrl).not.toContain('x-access-token');
+  });
+
+  it('redacts the token from clone failure error messages', async () => {
+    const SYNTHETIC_TOKEN = 'ghp_SYNTHETIC_LEAK_TOKEN_abc456';
+
+    // Simulate a git error that (hypothetically) included the token in its
+    // message. Even though we no longer put the token in the URL, the
+    // redaction layer must scrub any string that does happen to contain it.
+    const leakedError = new Error(
+      `fatal: unable to access 'https://x-access-token:${SYNTHETIC_TOKEN}@github.com/foo/bar.git/': repository not found`
+    );
+
+    simpleGitMock.mockReturnValue({
+      clone: jest.fn().mockRejectedValue(leakedError),
+      addConfig: jest.fn().mockResolvedValue(undefined),
+      checkoutLocalBranch: jest.fn().mockResolvedValue(undefined),
+      add: jest.fn().mockResolvedValue(undefined),
+      commit: jest.fn().mockResolvedValue(undefined),
+      push: jest.fn().mockResolvedValue(undefined),
+    });
+
+    let caught: Error | undefined;
+    try {
+      await createPr({
+        repoUrl: 'https://github.com/MohammedAlsabih/spec-pipeline-demo-app',
+        defaultBranch: 'master',
+        codegenOutput: MOCK_OUTPUT,
+        plan: MOCK_PLAN,
+        githubToken: SYNTHETIC_TOKEN,
+      });
+    } catch (e) {
+      caught = e as Error;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught!.message).not.toContain(SYNTHETIC_TOKEN);
+    expect(caught!.message).toContain('***');
   });
 });
